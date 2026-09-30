@@ -1,0 +1,349 @@
+# ae-bridge — usage rules
+
+MCP server for After Effects (`ae_*` tools). This file exists because several
+real bugs and wasted debugging cycles happened during development from
+guessing instead of checking, and from index/state assumptions that didn't
+hold. Read this before making non-trivial use of the `ae_*` tools.
+
+## Core rules
+
+1. **Never trust an index across calls.** Re-list (`ae_list_compositions`,
+   `ae_list_layers`, `ae_list_effects`, `ae_list_masks`) before addressing
+   something by index if anything might have changed — including after any
+   op that adds/removes/reorders items, and after AE was restarted.
+2. **Never run mutating calls in parallel if one could shift state another
+   depends on.** Two real bugs happened this way: `ae_create_folder` run
+   alongside comp-indexed calls (new project items insert at index 1,
+   shifting every composition index down by one), and `ae_move_layer` run
+   alongside `ae_set_layer_flags` targeting the same layer index (the flags
+   landed on the wrong layer). When call B needs call A's result to be
+   correct, run them sequentially.
+3. **Prefer matchName over display name** wherever both exist (effects,
+   blend modes, mask modes, track matte types). Some real values are
+   unintuitive — e.g. `BlendingMode.SILHOUETE_ALPHA` is a documented AE
+   typo, not a mistake to "fix".
+4. **Check https://ae-scripting.docsforadobe.dev before guessing a new
+   operation** on an object/method not already covered below. Fetch and
+   quote the primary page directly when precision matters — summarized web
+   search results have been outright wrong before (claimed AE has no font
+   enumeration API; it does, `app.fonts.allFonts`).
+5. **AE reverts to last-saved project state on restart.** Anything built in
+   a session but not saved is gone. Don't assume state persists across an
+   AE restart unless the user confirms they saved.
+6. **Verify visually with `ae_export_frame` rather than trusting "no
+   error".** Several real bugs (Round Corners, the easing dimension bug)
+   returned success with no exception while doing nothing or the wrong
+   thing. A clean response is not proof of a correct visual result.
+7. **Default to the JSX-first workflow for any new scene build**: write one
+   comprehensive `.jsx` script that does as close to all of the work as
+   possible (background, every element, real assets, styling) — checking
+   available project files/icons first, asking the user for anything
+   missing rather than guessing or substituting — run it via `AfterFX.exe
+   -r` (see Recipes), then use the bridge (`ae_*` tools) only for the
+   smaller follow-up adjustments the exported check reveals. This is
+   faster and far less timeout-prone than constructing the same scene
+   through many `ae_run_macro`/`ae_batch` round trips (see the gotcha
+   entries below on why), and it's the approach that's actually worked
+   cleanly on every build since it was adopted. Reserve pure `ae_*`/bridge
+   construction for small existing scenes or genuinely tiny additions.
+8. **Never write a literal numeric value into an effect property without
+   verifying its actual valid range first — don't assume it matches the
+   0-100 or 0-1 convention of some other property you're used to.** A real
+   crash happened from exactly this: Bevel's Light Intensity is a 0-1
+   float, written as `40` on the (wrong) assumption it was a percentage
+   like many other properties — AE halted the script with a modal "Value
+   40 out of range 0 to 1" dialog partway through a build, which (in a
+   `-r` script) blocks the AE UI waiting for a human to click OK, silently
+   swallowing everything queued after it. AE exposes the real range on the
+   property itself — `hasMin`/`hasMax` (booleans) and `minValue`/`maxValue`
+   (throw if the corresponding `hasMin`/`hasMax` is false) — so there's
+   never a need to guess. `ae_set_effect_property` (and `ops.setEffectProperty`
+   inside `ae_run_macro`) now check this automatically for plain numbers and
+   throw a clear, catchable error instead of letting AE hit it at runtime —
+   but that guard doesn't reach a `-r` script, since those run raw
+   ExtendScript with no bridge in front of them. Use this helper at the top
+   of every `.jsx` build script instead of calling `.setValue()` directly:
+   ```js
+   function setPropSafe(prop, value) {
+     if (typeof value === "number") {
+       if (prop.hasMin && value < prop.minValue) {
+         throw new Error(prop.name + ": " + value + " is below its minimum (" + prop.minValue + ")");
+       }
+       if (prop.hasMax && value > prop.maxValue) {
+         throw new Error(prop.name + ": " + value + " is above its maximum (" + prop.maxValue + ")");
+       }
+     }
+     prop.setValue(value);
+   }
+   ```
+
+## Known gotchas (confirmed — do not re-diagnose these)
+
+- **`ae_list_layers` hangs (times out) on a truly empty composition (0
+  layers)** — confirmed reproducible on two separate freshly-created comps,
+  while it works instantly on any comp with 1+ layers. Root cause not found
+  (the JS loop logic is sound for a 0-length case; likely an ExtendScript-
+  engine-level quirk accessing `.numLayers`/`.layer()` on an empty
+  CompItem). Workaround: don't call `ae_list_layers` on a comp you know is
+  still empty — add at least one layer first (you already know it's empty
+  if you just created it, so there's nothing to list anyway).
+- **`ae_batch` has TWO separate, confirmed failure modes, and the safe size
+  is smaller than it looks.**
+  1. *Long-payload hang*: an 11-call batch with several text layers' worth
+     of content (font/color/position strings) produced `SyntaxError:
+     Expected: ]` on the AE side — the line was likely split across
+     multiple socket reads, breaking the newline-delimited framing. This
+     one corrupts the connection; an AE restart was required to recover
+     (a plain reconnect was not sufficient).
+  2. *Silent short-batch failure*: separately, an 8-call batch of short
+     `ae_set_effect_property` calls (no long strings, just numbers/short
+     arrays) timed out too — but the bridge itself stayed completely
+     healthy afterward (ping and other calls worked immediately), and the
+     properties were simply never set (effect sat at its default values,
+     no error surfaced). Splitting the same 8 calls into two 4-call
+     batches worked immediately with no other change. So this isn't purely
+     about total string length — something about the *number* of calls
+     in one request line matters too, and 8 short calls already crossed
+     whatever the real limit is.
+
+  Root cause not fixed for either. Workaround: **keep batches to roughly
+  4-6 calls**, even when every call is short — don't assume "8 is fine
+  because they're small." If a batch fails, first check whether the bridge
+  is still responsive (`ae_ping`) — if it is, the batch likely just
+  silently no-op'd (re-verify state and redo in smaller batches); if `ping`
+  also hangs, that's the connection-corrupting variant and needs an AE
+  restart.
+- **`ae_run_macro` has the SAME silent-timeout failure mode as `ae_batch`'s
+  #2 above, not just `ae_batch`.** Observed rebuilding the same diagram via
+  macros: a 4-`setEffectProperty`-call macro (setting a 4-Color Gradient's
+  point/color properties) timed out at the client's 60s limit twice in a
+  row, but both times the bridge stayed healthy and the calls had actually
+  succeeded server-side (confirmed via `ae_export_frame` after each). An
+  11-call macro and a 9-call macro (heavy with literal vertex-array data)
+  both genuinely failed outright (0 layers created, matching failure mode
+  #1's total-loss pattern) until split smaller. By contrast, single-call
+  macros (one `setEffectProperty` per icon, one `getLayerBounds` +
+  reposition per label) were consistently fast with zero timeouts across
+  ~10 of them. **This was initially suspected to be effect-specific (4-Color
+  Gradient vs. Fill) — it isn't.** Checked Adobe's own scripting docs for
+  anything marking 4-Color Gradient as unusually expensive to script:
+  nothing found. The variable that actually lines up with every timeout in
+  this session's log is calls-per-macro (4, 9, 11 all timed out or failed;
+  1-3 never did), same as `ae_batch`'s documented limit. Treat `ae_run_macro`
+  scripts with the same "keep it to a handful of ops" discipline as
+  `ae_batch` batches — looping many `ops.*` calls in one macro doesn't
+  avoid this the way it avoids `ae_batch`'s per-call network overhead.
+- **The `ae_run_macro`/`ae_batch` timeouts are a property of the bridge's
+  socket transport itself, not of AE or of script size/complexity** —
+  confirmed by directly comparing against `AfterFX.exe -r` (see the Recipes
+  entry below). A 94-layer build (10 cards, each with nested shape groups,
+  path trims, keyframes, and expressions — far larger than any macro that
+  had timed out or failed via the bridge) ran via `-r` in about 2-3 seconds
+  with zero issues, immediately after several much smaller `ae_run_macro`
+  calls had timed out or failed outright on the exact same running AE
+  instance and project. This rules out "the script is too heavy" or "AE
+  itself is slow" as the cause. It's consistent with the bridge's
+  `app.scheduleTask`-driven poll loop and/or its socket read/write framing
+  being the actual bottleneck (still not root-caused at that level), not
+  anything about the work being requested. Practical upshot: for a large or
+  complex one-off build, prefer the `-r` command-line path over
+  `ae_run_macro` — it has no 60-second ceiling and no socket framing to
+  break.
+- **`layer.parent = x` silently compensates rotation (and position) to
+  preserve the layer's CURRENT on-screen appearance at the moment of
+  parenting** — confirmed twice now (once for position on a duplicated
+  layer, once for rotation on freshly-built children). If a script sets
+  `.parent` before the layer's own Position/Rotation have been set to their
+  final intended (parent-relative) values, AE adjusts them to cancel out
+  whatever the parent's transform already is, so the child keeps looking
+  exactly as it did pre-parent — e.g. parenting a fresh, unrotated icon to a
+  card background already rotated -4° left the icon at local rotation +4°
+  (an exact compensating offset), so it rendered upright instead of tilting
+  with the card. Fix: always set `.parent` FIRST, then explicitly set
+  Position AND Rotation (even to 0 — don't rely on "0 is the default" or
+  skip a falsy-looking `if (rotation) ...` guard, since that skips the
+  explicit reset and leaves whatever compensation AE already applied).
+- **`ae_export_frame`'s time argument is `timeInSeconds`, not `time`.**
+  Passing `time` is silently accepted (extra keys aren't rejected) and the
+  call falls back to its default — the comp's current time — with no error
+  at all. This went unnoticed for a long stretch of work because every
+  earlier export happened to want frame 0 anyway; it only surfaced once an
+  animation needed frames at specific non-zero times and every export kept
+  returning the same (wrong) frame. If a series of exports across different
+  times look suspiciously identical, check the actual argument name before
+  assuming the composition is broken.
+- **A bridge call can report a clean, fast `ok:true` — no timeout, no
+  error — while the mutation it made silently didn't stick.** Confirmed
+  once: a `runMacro` resize+reposition call on one card layer returned
+  success immediately, but a later unrelated check showed the layer still
+  at its old size/position; re-running the identical script the second time
+  worked and a fresh read-back confirmed it. This is a third failure mode
+  distinct from the two already documented above (long-payload hang, and
+  timeout-but-actually-succeeded) — this one gives no signal at all that
+  anything went wrong. It's rare enough that treating every `ok:true` as
+  suspect would be impractical, but for anything hard to visually spot in a
+  quick export (exact numeric properties, things off-screen or behind other
+  layers), a cheap follow-up read-back in a *separate* call is worth it
+  before moving on — verifying inside the same call that made the change
+  doesn't catch this, since that part did run correctly.
+- **Only one MCP client can hold the bridge at a time — two Claude sessions
+  with `ae-bridge` enabled knock each other off.** The host script tracks a
+  single client and replaces it whenever a new connection arrives (`New
+  client arrived while old one still marked connected=true — replacing it`
+  in `%TEMP%\claude-ae-bridge.log`). With two sessions each running their own
+  `ae-bridge` MCP server, both keep reconnecting and every longer call fails
+  with `AE bridge disconnected`, while a bare `ae_ping` can still slip
+  through — which makes it look like random flakiness rather than a
+  conflict. Diagnose: that log line repeating about once a second, and
+  `Get-CimInstance Win32_Process -Filter "Name='node.exe'"` showing two
+  `ae-bridge/server/src/index.js` processes with different parent
+  `claude.exe` PIDs. Fix: have the user close the other session (or disable
+  its `ae-bridge` server); don't kill another session's process yourself.
+- **`-r` build scripts must not let an error escape to AE.** An uncaught
+  error becomes a modal dialog that freezes AE (and the bridge's poll) until
+  someone clicks it. Wrap the whole script in `try/catch/finally` that writes
+  to a log file, removes the comp the script itself created on failure, and
+  always calls `app.endUndoGroup()`; then read the log file instead of
+  watching for a dialog. (Confirmed: a failing build logged its error, cleaned
+  up its partial comp, and AE never blocked.)
+- **Solids and nulls a script creates outlive their comp.** `comp.remove()`
+  leaves the solid/null footage items behind in the project's `Solids`
+  folder. When working in someone else's project, tag what you create
+  (`layer.source.comment = TAG` right after `addSolid`/`addNull`) and on
+  rebuild remove only tagged footage with `usedIn.length === 0` — never guess
+  by name alone. Also delete throwaway test comps' solids when you delete the
+  comp itself.
+- **`TextDocument.tracking` must be an integer** — computing it to fit a
+  target width and passing the float throws `"<n> is not an integer"`;
+  `Math.round` it. Also: a text layer's `sourceRectAtTime` returns tight glyph
+  bounds (top ≈ -cap height for all-caps), and point text's origin is its
+  first baseline, so setting `Position.y` to a baseline and aligning by
+  `rect.left` / `rect.width` places text on its ink edges exactly.
+- **To see every installed font's PostScript name, dump
+  `app.fonts.allFonts` from a `-r` script to a file** and grep it;
+  `ae_list_available_fonts` is fine for a narrow query, but broad ones
+  (`semi`, `condensed`) return hundreds of entries. Not every popular font is
+  present (Barlow Semi Condensed wasn't; only Barlow Condensed) — measure
+  candidates' widths at matched cap height before committing.
+- **Shape primitive `position`** (`ae_add_shape_primitive`, rect/ellipse) is
+  an OFFSET from the shape layer's own Transform Position (which defaults
+  to comp-center for a new layer) — not an absolute canvas coordinate.
+- **`ae_reorder_effect`** (and any `PropertyBase.moveTo()`-based reorder)
+  invalidates the moved property's own reference. Capture what you need
+  (e.g. its name) before calling `.moveTo()`; never read from the same
+  reference afterward.
+- **`ae_set_keyframe_easing`**'s temporal ease array needs exactly 1 entry
+  unless the property's dimensions are separated — for a multi-axis
+  property like Position. **This does NOT hold for every multi-axis
+  property** — confirmed via `setTemporalEaseAtKey` directly (not through
+  the tool) that Scale throws `"Value array does not have 3 elements"`
+  unless you pass one `KeyframeEase` per dimension (3 entries, e.g.
+  `[ease,ease,ease]`), even with all 3 dimensions still linked/unseparated.
+  Don't assume the 1-entry rule generalizes — if a property throws this
+  error, try one ease per dimension before anything else.
+- **Project item indices shift when ANY item elsewhere in the project is
+  added or removed — including unrelated compositions, not just items in
+  the same folder.** Confirmed concretely: icon footage indices inside a
+  shared "all icons" folder (established once and reused across several
+  builds) silently shifted by +1 after deleting unrelated leftover comps
+  from earlier work, with nothing about the folder or its contents touched
+  directly. A script that hardcodes a footage item's index from earlier in
+  the session — even a value that was definitely correct when first
+  checked — can silently point at the wrong asset later. Re-verify an
+  item's index immediately before use if anything else in the project has
+  changed since, the same discipline as rule #1 above, and don't assume
+  "I only touched comps, not this folder" is enough to skip the check.
+- **Round Corners** (`ae_add_shape_path_operation` with matchName
+  `'ADBE Vector Filter - RC'`) adds correctly and sets Radius correctly but
+  has NO visible effect on either a Rectangle primitive or a custom path —
+  root cause unknown. For a Rectangle, set `roundness` directly via
+  `ae_add_shape_primitive` instead. Trim Paths, by contrast, is confirmed
+  working correctly.
+- **`ae_render_composition`** without `outputModuleTemplate` silently
+  overrides your requested file extension with AE's default output format
+  (commonly MP4/H.264) — confirmed empirically (`.avi` and `.png` both
+  actually saved as `.mp4`, since AVI/QuickTime templates were removed from
+  AE around v22). Always check the response's `actualOutputPath` and
+  `succeeded` fields; never assume `outputPath` was honored as given.
+- **`ae_apply_effect_preset`**: Adobe Express presets are parametric
+  templates, not simple keyframe animations — they may need external
+  driving (Essential Properties) to visibly animate. A clean response
+  doesn't guarantee a visible effect for those specifically.
+
+## Recipes
+
+- **Shape**: `ae_create_shape_layer` → `ae_add_shape_group` →
+  `ae_add_shape_primitive` → `ae_add_shape_fill` / `ae_add_shape_stroke`.
+- **Kinetic type**: `ae_add_text_animator` → `ae_add_animator_property` →
+  `ae_set_animator_selector_range`.
+- **Mask**: `ae_add_mask` with `vertices`/`inTangents`/`outTangents`/`closed`.
+- **Multi-step build**: use `ae_batch` (same tool names, `{tool, args}`
+  pairs, one undo group, a failed item doesn't block later ones) instead of
+  many separate round trips.
+- **Bulk structured construction (many similar elements — e.g. 8 shapes with
+  the same pattern)**: use `ae_run_macro` instead of `ae_batch`. It runs a
+  JS snippet that calls `ops.*` (internal names — same conversion as
+  `ae_batch`: strip `ae_`, camelCase, e.g. `ae_add_shape_group` →
+  `ops.addShapeGroup`) in a loop, all in ONE round trip and ONE undo group —
+  no per-element network hop, which is where `ae_batch` still pays a cost
+  even at a safe batch size. It's a blocklist (rejects `File`/`Folder`/
+  `system.`/`ExternalObject`/`Socket`/`$.`/`eval`/`ScriptUI`/`app.quit`/
+  `app.project.save`), not a sandbox — it catches accidental misuse, not a
+  determined bypass. Only use it against a bridge whose network exposure
+  you trust (see Security note below).
+- **Large/complex one-off build, or diagnosing whether the bridge itself is
+  the problem**: write the script to a `.jsx` file and run it via
+  `AfterFX.exe -r "<path>"` instead of `ae_run_macro`:
+  ```
+  "C:\Program Files\Adobe\Adobe After Effects 2026\Support Files\AfterFX.exe" -r "C:\path\to\script.jsx"
+  ```
+  Confirmed (via direct test — a probe script and a 94-layer real build)
+  that when AE is already running, `-r` executes the script **against that
+  already-open instance and its current project**, not a separate process —
+  no file-lock conflict, no second AE window. No 60-second timeout, no JSON/
+  socket layer to break. Three things to know before using it:
+  1. **No blocklist at all** — unlike `ae_run_macro`, a script run this way
+     has full ExtendScript privileges (file/system/network/eval/ScriptUI,
+     everything). Only run scripts you've fully read and trust; there's no
+     automatic safety net here the way there is over the socket.
+  2. **Strip any modal call first** (`alert()`, `confirm()`, `prompt()`).
+     AE blocks synchronously waiting for a human to click it, and nobody's
+     watching a CLI invocation — this hangs AE with no timeout and no way
+     to recover except manually clicking the dialog in the AE window.
+  3. **Don't pass anything other than a real `-r`/`-s`/documented flag** when
+     AE is already running. An unrecognized argument (tested with a bare
+     `-help`) isn't treated as a CLI flag against the running instance —
+     AE tries to **import it as a file** and throws a visible "Can't import
+     file" error dialog in the user's open AE window. Verify a flag's exact
+     syntax before invoking rather than guessing at one.
+- Not yet built: shape/mask path editing after creation (no "set existing
+  shape/mask property by index" op), full waveform/beat analysis,
+  non-blocking render (not achievable — ExtendScript's render queue has no
+  async form).
+
+## One-time machine setup
+
+1. AE Preferences → General/Scripting & Expressions → enable "Allow Scripts
+   to Write Files and Access Network" (required or the bridge's socket
+   throws on start).
+2. `./install.ps1` from this directory, as Administrator.
+3. Restart After Effects. Confirm via `%TEMP%\claude-ae-bridge.log`.
+4. `cd server && npm install`.
+5. Restart the Claude Code session to load `.mcp.json`.
+
+Any time `host/claude-bridge.jsx` changes: re-run `install.ps1` and restart
+AE. Any time `server/src/*.js` changes: restart the Claude Code session.
+
+## Security note
+
+The bridge listens on `0.0.0.0` (all network interfaces), not just
+loopback — confirmed via `netstat`. On an untrusted network this is
+reachable by other devices, with no authentication. See README for detail;
+this was a deliberate accepted-risk decision on a trusted home network, not
+an oversight to silently "fix".
+
+The `AfterFX.exe -r` path (see Recipes) is a stronger trust boundary than
+either `ae_batch` or `ae_run_macro` — it's local-machine-only (not reachable
+over the network the way the socket is), but it has zero blocklist: any
+script run this way has full ExtendScript privileges, no restrictions at
+all. Treat it accordingly — only for scripts read and trusted first.

@@ -1,0 +1,19 @@
+{
+  "name": "ae-bridge-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fast MCP server for After Effects, talking to a native ExtendScript socket listener (no CEP).",
+  "main": "src/index.js",
+  "bin": {
+    "ae-bridge-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test-bridge": "node src/test-bridge.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.5"
+  }
+}
