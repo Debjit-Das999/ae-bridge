@@ -13,6 +13,10 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
 
     var PORT = 41890;
     var POLL_MS = 25;
+    // Don't start polling until AE has had time to finish launching/opening
+    // its project; a scheduled task that fires while a startup modal is up
+    // gets blocked by AE.
+    var START_DELAY_MS = 12000;
     // Keep this short: a blocking read here stalls AE's whole main thread.
     // If testing shows AE hitching while the bridge is idle, lower this further.
     var READ_TIMEOUT_SEC = 0.05;
@@ -1124,13 +1128,23 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     var client = null;
     var listening = false;
 
+    var lastListenAttempt = 0;
+    var listenFailures = 0;
+
     function tryListen() {
+        var now = new Date().getTime();
+        if (lastListenAttempt && now - lastListenAttempt < 2000) return;
+        lastListenAttempt = now;
         try {
             if (listener.listen(PORT)) {
                 listening = true;
+                listenFailures = 0;
                 log("Listening on 127.0.0.1:" + PORT);
             } else {
-                log("listen() returned false on port " + PORT + " — is another instance already running?");
+                listenFailures++;
+                if (listenFailures <= 3 || listenFailures % 100 === 0) {
+                    log("listen() returned false on port " + PORT + " (attempt #" + listenFailures + ") — is another instance already running?");
+                }
             }
         } catch (e) {
             log("listen() threw: " + e.toString() + " — check 'Allow Scripts to Write Files and Access Network' is enabled in AE Preferences.");
@@ -1169,7 +1183,22 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
     }
 
+    var polling = false;
+
+    // Runs on a repeating scheduled task. A tick that AE blocks (e.g. a modal
+    // dialog is open) is simply skipped and the next one runs normally; the
+    // old one-shot re-arm died permanently the first time a tick was blocked.
     function poll() {
+        if (polling) return;
+        polling = true;
+        try {
+            pollOnce();
+        } finally {
+            polling = false;
+        }
+    }
+
+    function pollOnce() {
         tickCount++;
         if (DEBUG && tickCount % 80 === 0) {
             log("heartbeat tick=" + tickCount + " listening=" + listening + " hasClient=" + !!client +
@@ -1211,7 +1240,6 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         } catch (e) {
             log("poll() outer error: " + e.toString());
         }
-        app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, false);
     }
 
     // Reads whatever complete lines are already available. A short
@@ -1245,9 +1273,25 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
     }
 
-    tryListen();
-    app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, false);
-    log("claude-bridge initialized (PORT=" + PORT + ")");
+    var bootstrapTaskId = null;
+    var pollTaskId = null;
 
-    return { poll: poll, dispatch: dispatch, PORT: PORT };
+    // Fires once START_DELAY_MS after launch, cancels itself, then starts the
+    // repeating poll task. The bootstrap is itself a repeating task so that if
+    // its first tick is blocked by a modal dialog it just fires again later.
+    function bootstrap() {
+        if (pollTaskId !== null) return;
+        if (bootstrapTaskId !== null) {
+            try { app.cancelTask(bootstrapTaskId); } catch (e) {}
+            bootstrapTaskId = null;
+        }
+        pollTaskId = app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, true);
+        log("polling started (every " + POLL_MS + "ms)");
+    }
+
+    tryListen();
+    bootstrapTaskId = app.scheduleTask("$.global.__claudeBridge.bootstrap()", START_DELAY_MS, true);
+    log("claude-bridge initialized (PORT=" + PORT + "), polling starts in " + START_DELAY_MS + "ms");
+
+    return { poll: poll, bootstrap: bootstrap, dispatch: dispatch, PORT: PORT };
 })();
