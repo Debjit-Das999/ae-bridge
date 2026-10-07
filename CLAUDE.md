@@ -34,18 +34,42 @@ hold. Read this before making non-trivial use of the `ae_*` tools.
    error".** Several real bugs (Round Corners, the easing dimension bug)
    returned success with no exception while doing nothing or the wrong
    thing. A clean response is not proof of a correct visual result.
-7. **Default to the JSX-first workflow for any new scene build**: write one
-   comprehensive `.jsx` script that does as close to all of the work as
-   possible (background, every element, real assets, styling) — checking
-   available project files/icons first, asking the user for anything
-   missing rather than guessing or substituting — run it via `AfterFX.exe
-   -r` (see Recipes), then use the bridge (`ae_*` tools) only for the
-   smaller follow-up adjustments the exported check reveals. This is
-   faster and far less timeout-prone than constructing the same scene
-   through many `ae_run_macro`/`ae_batch` round trips (see the gotcha
-   entries below on why), and it's the approach that's actually worked
-   cleanly on every build since it was adopted. Reserve pure `ae_*`/bridge
-   construction for small existing scenes or genuinely tiny additions.
+7. **Route every request: bridge (MCP) by default, JSX for big builds — and
+   don't make the user manage it.** Two ways to act on AE: the `ae_*` bridge
+   tools, and a `.jsx` script run via `AfterFX.exe -r` (see Recipes). Pick
+   like this:
+   - **Small task → bridge, no questions.** Tweaks to an existing scene,
+     adding/editing a few layers, effects, keyframes, renames, exports —
+     roughly under ~30 layers / ~100 ops. Just do it with `ae_*` tools
+     (macros/batches are fine for repetitive bits).
+   - **Large new structure → ask ONCE, up front, before building.** A new
+     multi-layer scene/comp or anything with many repeated elements
+     (roughly 30+ layers or 100+ ops). Ask a single short question:
+     "JSX script (one shot, fastest) or bridge steps (live, incremental)?"
+     and give a recommendation (JSX for big/pattern-heavy builds, bridge
+     when they want to watch and tweak as it goes). Then proceed.
+   - **Remember the answer for the session. Don't re-ask** for later large
+     builds unless the user changes it or the job is very different. If the
+     user says "always JSX" / "always bridge" / "just pick", treat that as
+     standing for the session.
+   - **Bridge not running → use JSX automatically, no question.** If
+     `ae_ping` errors / says not connected, or a bridge call fails twice
+     after one retry, switch to the JSX route and say so in one line. If AE
+     itself isn't running, tell the user and offer to launch it (don't
+     launch silently).
+   - **JSX route rules:** write one comprehensive script (background, every
+     element, real assets, styling), checking available project files/icons
+     first and asking only for what's genuinely missing rather than
+     guessing. Follow rule 8 (`setPropSafe`), the `try/catch/finally`+log
+     gotcha, tag anything created, never hardcode project/comp indices, no
+     modal calls. Verify visually: via `ae_export_frame` if the bridge is
+     up, otherwise have the script save a frame and read the PNG.
+   - After a JSX build, use the bridge for small follow-up adjustments
+     when it's available.
+   Why: the bridge is fast, live and incremental for small work; JSX avoids
+   per-call round trips and the 60s ceiling on very large builds. (The old
+   guidance "JSX-first for everything" predates the transport fixes — the
+   bridge is now reliable for sizeable macros/batches, see gotchas.)
 8. **Never write a literal numeric value into an effect property without
    verifying its actual valid range first — don't assume it matches the
    0-100 or 0-1 convention of some other property you're used to.** A real
@@ -183,13 +207,13 @@ hold. Read this before making non-trivial use of the `ae_*` tools.
   with zero issues, immediately after several much smaller `ae_run_macro`
   calls had timed out or failed outright on the exact same running AE
   instance and project. This rules out "the script is too heavy" or "AE
-  itself is slow" as the cause. It's consistent with the bridge's
-  `app.scheduleTask`-driven poll loop and/or its socket read/write framing
-  being the actual bottleneck (still not root-caused at that level), not
-  anything about the work being requested. Practical upshot: for a large or
-  complex one-off build, prefer the `-r` command-line path over
-  `ae_run_macro` — it has no 60-second ceiling and no socket framing to
-  break.
+  itself is slow" as the cause. **Root-caused 2026-10-07:** it was the
+  socket framing (fragmented requests + empty-array responses), now fixed —
+  see the ROOT CAUSES entry at the top of this section. After the fixes the
+  bridge handles big macros fine (1,600 ops in ~16s). `-r` still has no
+  60-second ceiling and no socket layer, so it remains the better route for
+  very large one-shot builds — but routing is governed by rule 7 (bridge by
+  default, ask once for big builds, JSX automatically if the bridge is down).
 - **`layer.parent = x` silently compensates rotation (and position) to
   preserve the layer's CURRENT on-screen appearance at the moment of
   parenting** — confirmed twice now (once for position on a duplicated
