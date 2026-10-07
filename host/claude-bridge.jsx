@@ -20,6 +20,11 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     // Keep this short: a blocking read here stalls AE's whole main thread.
     // If testing shows AE hitching while the bridge is idle, lower this further.
     var READ_TIMEOUT_SEC = 0.05;
+    // Writes need far longer than reads: a large response written with the
+    // 50ms read timeout can be cut off mid-line.
+    var WRITE_TIMEOUT_SEC = 10;
+    // Drop a connection's buffered input if it grows this big with no newline.
+    var MAX_RX_CHARS = 32 * 1024 * 1024;
     var LOG_PATH = Folder.temp.fsName + "/claude-ae-bridge.log";
 
     function log(msg) {
@@ -65,7 +70,15 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     }
     function jsonStringify(v) {
         if (typeof JSON !== "undefined" && JSON.stringify) {
-            try { return JSON.stringify(v); } catch (e) { /* fall through */ }
+            try {
+                // AE's native JSON.stringify writes an empty array as "[\n\n]".
+                // The wire protocol is one message per line, so those raw
+                // newlines split the response and the client drops it (the
+                // call "times out" even though it succeeded). Newlines inside
+                // string values are always escaped, so any raw CR/LF in the
+                // output is structural whitespace and safe to strip.
+                return JSON.stringify(v).replace(/[\r\n]+/g, "");
+            } catch (e) { /* fall through */ }
         }
         return stringifyValue(v);
     }
@@ -1155,6 +1168,21 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     var DEBUG = false;
     var tickCount = 0;
     var consecutiveReadErrors = 0;
+    // Bytes received but not yet terminated by a newline. A request can arrive
+    // split across several reads; only a complete line is ever parsed.
+    var rxBuffer = "";
+
+    function sendLine(text) {
+        var prevTimeout = client.timeout;
+        client.timeout = WRITE_TIMEOUT_SEC;
+        try {
+            if (!client.write(text + "\n")) {
+                log("write() returned false for a " + text.length + "-char response");
+            }
+        } finally {
+            client.timeout = prevTimeout;
+        }
+    }
 
     function handleLine(line) {
         var id = null;
@@ -1166,12 +1194,13 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
             var result = dispatch(req.op, req.args);
             var resp = jsonStringify({ id: id, ok: true, result: result });
             if (DEBUG) log("Writing success response for id=" + id + " (" + resp.length + " chars)");
-            client.writeln(resp);
+            sendLine(resp);
             if (DEBUG) log("Wrote success response for id=" + id);
         } catch (e) {
-            log("handleLine error for id=" + id + ": " + e.toString());
+            log("handleLine error for id=" + id + " (line " + line.length + " chars, starts " +
+                line.substring(0, 60).replace(/[\r\n]/g, " ") + "): " + e.toString());
             try {
-                client.writeln(jsonStringify({
+                sendLine(jsonStringify({
                     id: id,
                     ok: false,
                     error: { message: e.toString ? e.toString() : String(e), line: e.line, fileName: e.fileName }
@@ -1225,6 +1254,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                     client = incoming;
                     client.timeout = READ_TIMEOUT_SEC;
                     consecutiveReadErrors = 0;
+                    rxBuffer = "";
                     log("Client connected");
                 }
             }
@@ -1233,6 +1263,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                 if (!client.connected) {
                     log("Client disconnected");
                     client = null;
+                    rxBuffer = "";
                 } else {
                     drainLines();
                 }
@@ -1252,24 +1283,45 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     // instead of being silently swallowed forever.
     function drainLines() {
         for (;;) {
-            var line;
+            var chunk;
             try {
-                line = client.readln();
+                // read(n) returns whatever has arrived (up to n chars) within
+                // the timeout. Unlike readln(), a partial line is kept in
+                // rxBuffer instead of being handed to the parser as if it
+                // were a whole message.
+                chunk = client.read(65536);
                 consecutiveReadErrors = 0;
             } catch (e) {
                 consecutiveReadErrors++;
                 if (consecutiveReadErrors <= 3 || consecutiveReadErrors % 200 === 0) {
-                    log("readln() error (#" + consecutiveReadErrors + "): " + e.toString() +
+                    log("read() error (#" + consecutiveReadErrors + "): " + e.toString() +
                         " connected=" + client.connected);
                 }
                 if (client && !client.connected) {
                     log("Client disconnected during read: " + e.toString());
                     client = null;
+                    rxBuffer = "";
                 }
                 return;
             }
-            if (!line) return;
-            handleLine(line);
+            if (chunk) rxBuffer += chunk;
+
+            var nl;
+            while ((nl = rxBuffer.indexOf("\n")) !== -1) {
+                var line = rxBuffer.substring(0, nl);
+                rxBuffer = rxBuffer.substring(nl + 1);
+                if (line.length && line.charAt(line.length - 1) === "\r") {
+                    line = line.substring(0, line.length - 1);
+                }
+                if (line) handleLine(line);
+                if (!client) return;
+            }
+
+            if (rxBuffer.length > MAX_RX_CHARS) {
+                log("Dropping " + rxBuffer.length + " buffered chars with no newline (over MAX_RX_CHARS)");
+                rxBuffer = "";
+            }
+            if (!chunk) return;
         }
     }
 

@@ -79,12 +79,53 @@ hold. Read this before making non-trivial use of the `ae_*` tools.
 
 ## Known gotchas (confirmed — do not re-diagnose these)
 
+- **ROOT CAUSES FOUND (2026-10-07) for most of the "timeout" mysteries below.**
+  Two real transport bugs, both fixed in `host/claude-bridge.jsx` (re-run
+  `install.ps1` + restart AE to get the fix; `bridge-client.js` change needs
+  a Claude session restart):
+  1. *Fragmented requests.* The host read with `readln()` on a 50ms-timeout
+     socket, so any request that arrived in several pieces (a 4KB macro
+     arrived as 5) was parsed as 5 broken "messages" — log showed
+     `handleLine error for id=null: JSON.parse` — the macro never ran and the
+     client waited out its timeout. Fix: buffered `read()` that only parses
+     once a newline arrives. This is what "long payload hang" and the
+     `Expected: ]` SyntaxError were.
+  2. *Empty arrays in a response.* AE's native `JSON.stringify` writes `[]` as
+     `"[\n\n]"` (raw newlines). The wire protocol is one message per line, so
+     the response was split, Node silently dropped the unparseable pieces, and
+     the call "timed out" **even though the work had succeeded**. Any response
+     containing an empty list (no effects, no layers, no matches, empty
+     `results`) did this — including the `ae_list_layers`-on-empty-comp hang
+     below. Fix: strip raw CR/LF from the serialized response. Diagnose with:
+     a call that times out while the log shows no error and the change DID
+     apply.
+  Also fixed: responses are written with a 10s timeout (was 50ms), and
+  `bridge-client.js` now logs unparseable lines to stderr instead of
+  swallowing them. The batch-size / macro-size limits quoted below were
+  measured BEFORE these fixes; re-measure before trusting them.
+  **Verified after the fixes:** 4KB macro; 256KB response (intact); 8 short
+  `ae_set_effect_property` calls in one `ae_batch`; 11-call `ae_batch` with
+  ~3KB of text; 8 concurrent macros (all answered, in order); empty-array
+  responses; `ae_list_layers` on an empty comp; macros that throw / have
+  syntax errors (instant clean error). 800 macro ops (200 layers) ran in ~8s.
+  Also verified: 100-call `ae_batch` (all ok); 15 simultaneous mixed calls;
+  1MB and 4MB responses (intact); 2000-op macro in 0.4s; 1600 ops/400 layers
+  in 16s (cost ~linear); 30s macro OK, 62s macro times out client-side and the
+  bridge recovers cleanly; connection fine after 2.5min idle; unicode/CRLF/
+  U+2028 round-trip. Not tested: requests >64KB (tested to ~9KB), batches
+  >100 calls. No remaining transport failures reproduced.
+- **Macro/batch ops address comps by index — and creating ANY project item
+  (solid, comp, folder, footage) mid-script shifts those indices.** In a
+  stress test, `ops.createSolid({compIndex: N})` followed by more ops with the
+  same `compIndex` silently landed on a *different* comp (the user's real
+  one). Inside a macro, either avoid item-creating ops or re-resolve the comp
+  index by name after each one; never hardcode an index across a
+  `createSolid`/`createComposition`/`createFolder`/`importFootage`.
 - **`ae_list_layers` hangs (times out) on a truly empty composition (0
   layers)** — confirmed reproducible on two separate freshly-created comps,
-  while it works instantly on any comp with 1+ layers. Root cause not found
-  (the JS loop logic is sound for a 0-length case; likely an ExtendScript-
-  engine-level quirk accessing `.numLayers`/`.layer()` on an empty
-  CompItem). Workaround: don't call `ae_list_layers` on a comp you know is
+  while it works instantly on any comp with 1+ layers. **Root cause is the
+  empty-array JSON bug above** (response `{layers: []}` was split on raw
+  newlines and dropped) — fixed in the host script. Old workaround: don't call `ae_list_layers` on a comp you know is
   still empty — add at least one layer first (you already know it's empty
   if you just created it, so there's nothing to list anyway).
 - **`ae_batch` has TWO separate, confirmed failure modes, and the safe size

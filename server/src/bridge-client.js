@@ -79,7 +79,9 @@ export class BridgeClient {
       try {
         msg = JSON.parse(line);
       } catch (e) {
-        dbg("failed to parse line as JSON:", JSON.stringify(line), e.message);
+        // Always surface this (stderr, so MCP stdio stays clean): a dropped
+        // response otherwise shows up only as a 60s timeout.
+        console.error("[ae-bridge] unparseable line from AE (" + line.length + " chars): " + line.slice(0, 120));
         continue;
       }
       const p = this.pending.get(msg.id);
