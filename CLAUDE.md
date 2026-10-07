@@ -5,6 +5,12 @@ real bugs and wasted debugging cycles happened during development from
 guessing instead of checking, and from index/state assumptions that didn't
 hold. Read this before making non-trivial use of the `ae_*` tools.
 
+**This repo is Windows-only.** The macOS port is a separate fork
+(`github.com/Debjit-Das999/ae-bridge-mac`, developed in its own chat/folder).
+Don't edit, commit to, or push the Mac repo from work on this one, and keep
+Windows-specific details (`install.ps1`, `AfterFX.exe -r`, `%TEMP%`) here.
+Fixes that apply to both (e.g. transport/host-script bugs) must be ported by hand.
+
 ## Core rules
 
 1. **Never trust an index across calls.** Re-list (`ae_list_compositions`,
@@ -264,6 +270,11 @@ hold. Read this before making non-trivial use of the `ae_*` tools.
   `ae-bridge/server/src/index.js` processes with different parent
   `claude.exe` PIDs. Fix: have the user close the other session (or disable
   its `ae-bridge` server); don't kill another session's process yourself.
+  Since 2026-10-07 each MCP server also stops reconnecting once AE is closed:
+  after 4 failed connects (~8s) it goes dormant (logs one line to stderr) and
+  the next tool call wakes it. That removes idle-session churn while AE is
+  down, but sessions still contend while AE is *running* (tested against a
+  fake server via `AE_BRIDGE_PORT`, a test-only port override).
 - **`-r` build scripts must not let an error escape to AE.** An uncaught
   error becomes a modal dialog that freezes AE (and the bridge's poll) until
   someone clicks it. Wrap the whole script in `try/catch/finally` that writes

@@ -2,10 +2,16 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 
 const HOST = "127.0.0.1";
-const PORT = 41890;
+// AE_BRIDGE_PORT only exists so tests can point at a fake server; the host script
+// (claude-bridge.jsx) always listens on 41890.
+const PORT = Number(process.env.AE_BRIDGE_PORT) || 41890;
 const CALL_TIMEOUT_MS = 15000;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5000;
+// After this many failed connection attempts in a row (AE closed / not running)
+// stop retrying and go dormant; the next tool call wakes the client up again.
+// 4 attempts ~= 0.5 + 1 + 2 + 4s of retrying.
+const MAX_FAILED_CONNECTS = 4;
 
 // Temporary diagnostic verbosity — prints to stderr so it doesn't pollute
 // MCP stdio. Set to true to debug connection issues.
@@ -23,6 +29,16 @@ export class BridgeClient {
     this.pending = new Map();
     this.reconnectDelay = RECONNECT_BASE_MS;
     this.started = false;
+    this.failedConnects = 0;
+    this.dormant = false;
+  }
+
+  // Resume connecting after going dormant (called when a tool call arrives).
+  _wake() {
+    this.dormant = false;
+    this.failedConnects = 0;
+    this.reconnectDelay = RECONNECT_BASE_MS;
+    this._attemptConnect();
   }
 
   // Kicks off a persistent background connect/reconnect loop. Safe to call
@@ -42,6 +58,8 @@ export class BridgeClient {
       this.connected = true;
       this.connecting = false;
       this.reconnectDelay = RECONNECT_BASE_MS;
+      this.failedConnects = 0;
+      this.dormant = false;
       dbg("connected, localPort=", socket.localPort);
     });
     socket.setEncoding("utf8");
@@ -60,7 +78,19 @@ export class BridgeClient {
       this.connecting = false;
       this.socket = null;
       this.buffer = "";
-      if (wasConnected) this._rejectAllPending(new Error("AE bridge disconnected"));
+      if (wasConnected) {
+        this._rejectAllPending(new Error("AE bridge disconnected"));
+        this.failedConnects = 0; // a drop after a good connection restarts the count
+      } else {
+        this.failedConnects++;
+      }
+      if (this.failedConnects >= MAX_FAILED_CONNECTS) {
+        // AE is closed/unreachable: stop spinning. call() wakes us on next use.
+        this.dormant = true;
+        console.error("[ae-bridge] After Effects not reachable on port " + PORT +
+          " - pausing reconnect attempts until the next tool call.");
+        return;
+      }
       const delay = this.reconnectDelay;
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
       setTimeout(() => this._attemptConnect(), delay);
@@ -124,6 +154,7 @@ export class BridgeClient {
 
   async call(op, args, opts = {}) {
     this.start();
+    if (!this.connected && this.dormant) this._wake();
     if (!this.connected) {
       await this._waitForConnection(3000).catch(() => {});
     }
