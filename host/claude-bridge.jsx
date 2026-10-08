@@ -1212,6 +1212,16 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
     }
 
+    // Tell a client it is being displaced by a newer one, so it can stay
+    // disconnected instead of reconnecting and taking the connection back
+    // (several Claude sessions otherwise swap the connection forever).
+    function notifyEvicted(sock) {
+        try {
+            sock.timeout = 1;
+            sock.write(jsonStringify({ event: "evicted", reason: "another client connected" }) + "\n");
+        } catch (e) { /* peer may already be gone */ }
+    }
+
     var polling = false;
 
     // Runs on a repeating scheduled task. A tick that AE blocks (e.g. a modal
@@ -1249,6 +1259,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                 if (incoming) {
                     if (client) {
                         log("New client arrived while old one still marked connected=" + client.connected + " — replacing it.");
+                        notifyEvicted(client);
                         try { client.close(); } catch (eClose) {}
                     }
                     client = incoming;
@@ -1325,25 +1336,31 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
     }
 
-    var bootstrapTaskId = null;
+    var bootstrapTaskIds = [];
     var pollTaskId = null;
 
     // Fires once START_DELAY_MS after launch, cancels itself, then starts the
     // repeating poll task. The bootstrap is itself a repeating task so that if
     // its first tick is blocked by a modal dialog it just fires again later.
     function bootstrap() {
-        if (pollTaskId !== null) return;
-        if (bootstrapTaskId !== null) {
-            try { app.cancelTask(bootstrapTaskId); } catch (e) {}
-            bootstrapTaskId = null;
+        // Idempotent: also called by backup timers and by host/start-bridge.jsx.
+        for (var i = 0; i < bootstrapTaskIds.length; i++) {
+            try { app.cancelTask(bootstrapTaskIds[i]); } catch (e) {}
         }
+        bootstrapTaskIds = [];
+        if (pollTaskId !== null) return;
         pollTaskId = app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, true);
         log("polling started (every " + POLL_MS + "ms)");
     }
 
     tryListen();
-    bootstrapTaskId = app.scheduleTask("$.global.__claudeBridge.bootstrap()", START_DELAY_MS, true);
-    log("claude-bridge initialized (PORT=" + PORT + "), polling starts in " + START_DELAY_MS + "ms");
+    // The first start timer has been seen not to fire after some AE launches, so
+    // register backups; the first to fire cancels the rest.
+    var startDelays = [START_DELAY_MS, 45000, 120000];
+    for (var sd = 0; sd < startDelays.length; sd++) {
+        bootstrapTaskIds.push(app.scheduleTask("$.global.__claudeBridge.bootstrap()", startDelays[sd], true));
+    }
+    log("claude-bridge initialized (PORT=" + PORT + "), polling starts in " + START_DELAY_MS + "ms (backup timers: 45s, 120s; task ids " + bootstrapTaskIds.join(",") + ")");
 
     return { poll: poll, bootstrap: bootstrap, dispatch: dispatch, PORT: PORT };
 })();

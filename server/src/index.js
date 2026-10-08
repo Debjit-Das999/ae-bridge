@@ -12,6 +12,7 @@ registerTools(server, bridge);
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-// Don't block startup on AE being open yet; the bridge connects/reconnects
-// in the background, so tools just surface a clear error until AE is up.
-bridge.start();
+// Deliberately do NOT connect at startup. Only one Claude session can hold the
+// AE bridge, and connecting evicts the current holder, so a session connects
+// lazily on its first tool call (or explicitly via ae_connect) instead of
+// stealing AE the moment it is opened.

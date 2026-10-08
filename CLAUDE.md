@@ -63,6 +63,13 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
      after one retry, switch to the JSX route and say so in one line. If AE
      itself isn't running, tell the user and offer to launch it (don't
      launch silently).
+   - **"Disconnected because another session took over" → `ae_connect`.**
+     Only one Claude session can hold the bridge. If a tool fails with that
+     message (or says this session released AE), the user is asking for AE
+     work *here*, so call `ae_connect` (it disconnects the other session),
+     retry once, and say so in one line. Don't loop: if it gets displaced
+     again right away, stop and tell the user another session is actively
+     using AE.
    - **JSX route rules:** write one comprehensive script (background, every
      element, real assets, styling), checking available project files/icons
      first and asking only for what's genuinely missing rather than
@@ -270,6 +277,43 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   `ae-bridge/server/src/index.js` processes with different parent
   `claude.exe` PIDs. Fix: have the user close the other session (or disable
   its `ae-bridge` server); don't kill another session's process yourself.
+  **Recurring: the delayed polling start sometimes never fires after an AE
+  launch (seen 3 times on 2026-10-07/08).** Symptom: log shows `claude-bridge
+  initialized ... polling starts in 12000ms` but no `polling started` line;
+  TCP connects succeed (the listener is open) but every call times out, in
+  every session, with no dialog open in AE. Cause unknown (the start timer is
+  registered during the Startup-script phase). Manual fix that always works:
+  `AfterFX.exe -r host/start-bridge.jsx`. **Second failure mode found the
+  same day:** `polling started` was logged but the repeating poll task
+  registered at launch was dead (connections sat un-accepted for 12 minutes);
+  `bootstrap()` alone can't fix that because it no-ops once polling is
+  *marked* started. A poll task registered from the `-r` context always runs
+  (verified), so `start-bridge.jsx` now registers a fresh one every time
+  (`poll()` is overlap-guarded, so a duplicate is harmless). AE itself ran
+  scheduled tasks fine throughout, with no dialog open — it is specific to the
+  launch-registered tasks.
+  Automatic recovery now built in (it runs `start-bridge.jsx` itself, at most
+  once per 60s, only while connected so it can never launch AE): a **ping**
+  that is unanswered after 1.5s triggers it (ping times out at 5s, not 15s);
+  a connection that has never heard from AE triggers it at 4s; after 20s of
+  silence a real call is preceded by a quick ping probe so the host is
+  revived *before* the call is sent; and any call timeout also triggers it.
+  (First version only had the 4s/timeout triggers, so a chat that had heard
+  from AE earlier saw its first ping fail after the full 15s.) **Never cancel scheduled
+  task ids you didn't create** (other panels' timers share the id space). The host also registers backup start timers (45s,
+  120s) and logs the timer ids — **those need `install.ps1` + AE restart**; the
+  auto-kick only needs the session restarted. If it still happens, the logged
+  task ids are the next clue.
+  **Fixed (2026-10-08): connection ownership is now explicit.** Sessions no
+  longer connect at launch (`index.js` used to call `bridge.start()`, so every
+  new session stole AE). A session connects lazily on its first tool call, or
+  explicitly with `ae_connect`. When a new client connects, the host sends the
+  old one `{"event":"evicted"}` before closing it; the old session then stays
+  disconnected (no auto-reconnect) and its calls fail with a message pointing
+  to `ae_connect`. `ae_disconnect` releases AE; `ae_status` reports local
+  state. **Requires re-running `install.ps1` as Administrator + restarting AE
+  (host change) and restarting every Claude session (server change)** — a
+  session still on the old server will keep reconnecting and fighting.
   Since 2026-10-07 each MCP server also stops reconnecting once AE is closed:
   after 4 failed connects (~8s) it goes dormant (logs one line to stderr) and
   the next tool call wakes it. That removes idle-session churn while AE is

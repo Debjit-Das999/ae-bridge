@@ -42,6 +42,32 @@ export function registerTools(server, bridge) {
   );
 
   tool(
+    "ae_connect",
+    "Take over the After Effects bridge for THIS Claude session, disconnecting whichever other session " +
+      "currently holds it (only one session can be connected at a time). Use it when the user asks to " +
+      "connect, or when another tool fails saying this session was disconnected because another session " +
+      "took over. Does not touch After Effects itself.",
+    {},
+    () => bridge.connect()
+  );
+
+  tool(
+    "ae_disconnect",
+    "Release this session's After Effects connection so another Claude session can use it. This session " +
+      "stays disconnected until ae_connect is called.",
+    {},
+    () => bridge.disconnect()
+  );
+
+  tool(
+    "ae_status",
+    "Report this session's own bridge connection state (connected / dormant / disconnected-by-another-session) " +
+      "without contacting After Effects.",
+    {},
+    () => bridge.status()
+  );
+
+  tool(
     "ae_list_compositions",
     "List all compositions in the currently open After Effects project, with their project-panel index.",
     {},
