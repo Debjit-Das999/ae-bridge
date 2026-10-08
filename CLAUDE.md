@@ -17,8 +17,12 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
 - Only one Claude session holds AE. A call that says this session "was
   disconnected because another session took over" → call `ae_connect`, retry
   once (see rule 7). `ae_ping` should answer in milliseconds; it times out at 5s.
-- A ping/call timeout on a live connection auto-runs `host/start-bridge.jsx`;
-  don't re-diagnose that, just retry. Never cancel scheduled-task ids you
+- User says "pause" / "ae pause" / "stop the bridge" → call `ae_pause` (stops AE polling at once, stays
+  connected; the next AE call restarts it automatically — that wake can bring the AE window to the front).
+- The host polls continuously while a session is connected (AE can show the
+  modal-dialog error / flicker the tool cursor); it stops 5s after disconnect or on `ae_pause`,
+  and the server wakes it automatically on connect/next call (+~0.2–0.4s). A ping/call timeout on a live connection
+  also auto-runs `host/start-bridge.jsx`; don't re-diagnose that, just retry. Never cancel scheduled-task ids you
   didn't create (other panels share the id space).
 
 **Before you build**
@@ -384,6 +388,33 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   the next tool call wakes it. That removes idle-session churn while AE is
   down, but sessions still contend while AE is *running* (tested against a
   fake server via `AE_BRIDGE_PORT`, a test-only port override).
+- **Fixed (2026-10-08): poll task only runs while the bridge is in use.** The
+  always-on 25ms poll task caused two user-visible problems: (1) opening any
+  property dialog (Fill/colour picker, Map Black To…) popped "Unable to execute
+  script at line 0… Cannot run a script while a modal dialog is waiting for
+  response" — AE blocks every task firing during a modal, and "line 0" is the
+  poll task itself, so the error can't be caught in our script; (2) tool
+  cursors (pen/shape) flickered between the tool and the arrow, even after
+  `ae_disconnect`, because each task run makes AE re-evaluate the cursor.
+  Now the host cancels the poll task 5s after the last client goes away (e.g.
+  `ae_disconnect`) or when told to (`ae_pause`), and sends `{"event":"sleep"}`.
+  **While a session is connected it never pauses on its own** (an idle timer was
+  tried at 15s and 60s: the server can't see when a Claude turn ends, only calls,
+  and gaps between a working Claude's calls exceed those, so it kept pausing and
+  waking mid-task, and every wake can bring the AE window to the front). So the
+  flicker/modal error persist while connected unless the user says pause. A
+  client that dies without closing its socket keeps the host polling until a new
+  client connects or `ae_pause`. The
+  server wakes it by running `start-bridge.jsx` (→ `wake()`, which registers a
+  fresh task from the `-r` context) on every connect, and before a call when it
+  knows the host is asleep (min 3s between runs). `ae_pause` pauses on demand (host op `pause`; needs the new host installed).
+  Cost: the first call after a
+  quiet spell waits for the `-r` spawn (measured live: 0.2–0.4s; awake calls take a few ms). Residual: opening a dialog *while Claude is
+  actively calling* can still show the error box — click OK, or tell Claude to
+  pause. **Needs `install.ps1` + AE restart (host) and session restart (server).**
+  A not-yet-updated host still works with the new server (start-bridge.jsx
+  falls back to the old logic); an old server against the new host recovers
+  through its ping kick.
 - **`-r` build scripts must not let an error escape to AE.** An uncaught
   error becomes a modal dialog that freezes AE (and the bridge's poll) until
   someone clicks it. Wrap the whole script in `try/catch/finally` that writes

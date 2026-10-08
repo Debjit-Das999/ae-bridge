@@ -60,6 +60,16 @@ export function registerTools(server, bridge) {
   );
 
   tool(
+    "ae_pause",
+    "Pause the After Effects bridge right now, so After Effects is left completely alone (no script " +
+      "interruptions, no cursor flicker, no 'modal dialog' errors while the user works in AE). Use when the " +
+      "user says 'pause', 'ae pause' or 'stop the bridge'. The session stays connected and the bridge restarts " +
+      "automatically on the next After Effects tool call (that wake may bring the AE window to the front).",
+    {},
+    () => bridge.pause()
+  );
+
+  tool(
     "ae_status",
     "Report this session's own bridge connection state (connected / dormant / disconnected-by-another-session) " +
       "without contacting After Effects.",

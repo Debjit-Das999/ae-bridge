@@ -11,6 +11,8 @@ import { randomUUID } from "node:crypto";
 // AE_BRIDGE_KICK_SCRIPT exist so tests can substitute a stub.
 const KICK_AFTER_MS = 4000;
 const KICK_COOLDOWN_MS = 60000;
+// Minimum gap between two runs of start-bridge.jsx (waking the host / kicking it).
+const WAKE_MIN_GAP_MS = 3000;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const HOST = "127.0.0.1";
@@ -58,6 +60,8 @@ export class BridgeClient {
     this.lastHeard = 0; // when AE last sent us anything (or when we connected)
     this.kickTimer = null;
     this.lastKick = 0;
+    this.lastSpawn = 0;
+    this.hostAsleep = false; // AE told us it paused polling because we were idle
   }
 
   _findAeExe() {
@@ -82,21 +86,35 @@ export class BridgeClient {
     }, KICK_AFTER_MS);
   }
 
-  _kickHost() {
-    // Only with a live connection: that proves AE is running, so `-r` runs the
-    // script inside it instead of launching a new AE.
+  // The host pauses its poll task when idle (so AE isn't interrupted while nobody is
+  // using the bridge); resume it. Needs a live connection: that proves AE is running,
+  // so `-r` runs the script inside it instead of launching a new AE.
+  _wakeHost() {
     if (!this.connected) return;
     const now = Date.now();
-    if (now - this.lastKick < KICK_COOLDOWN_MS) return;
+    if (now - this.lastSpawn < WAKE_MIN_GAP_MS) return;
+    this._runStartScript("waking the host");
+  }
+
+  _kickHost() {
+    if (!this.connected) return;
+    const now = Date.now();
+    if (now - this.lastKick < KICK_COOLDOWN_MS || now - this.lastSpawn < WAKE_MIN_GAP_MS) return;
     this.lastKick = now;
+    console.error("[ae-bridge] connected but After Effects is not answering - starting the bridge via start-bridge.jsx");
+    this._runStartScript("kicking the host");
+  }
+
+  _runStartScript(why) {
+    this.lastSpawn = Date.now();
     const exe = this._findAeExe();
     const script = process.env.AE_BRIDGE_KICK_SCRIPT || path.resolve(HERE, "..", "..", "host", "start-bridge.jsx");
     if (!exe || !fs.existsSync(script)) {
-      console.error("[ae-bridge] After Effects is connected but not answering, and the start script/AfterFX.exe " +
-        "could not be found; run host/start-bridge.jsx inside AE manually.");
+      console.error("[ae-bridge] cannot run host/start-bridge.jsx in After Effects (AfterFX.exe or the script " +
+        "was not found); if AE is not answering, run host/start-bridge.jsx inside AE manually.");
       return;
     }
-    console.error("[ae-bridge] connected but After Effects is not answering - starting the bridge via start-bridge.jsx");
+    dbg(why + " via start-bridge.jsx");
     try {
       spawn(exe, ["-r", script], { detached: true, stdio: "ignore", windowsHide: true }).unref();
     } catch (e) {
@@ -139,6 +157,24 @@ export class BridgeClient {
     return { disconnected: true, wasConnected: had };
   }
 
+  // Stop AE's poll task right now (no cursor flicker / modal-dialog errors while the
+  // user works in AE). It restarts by itself on the next call. Stays connected.
+  async pause() {
+    if (this.suspendedReason) return { paused: false, note: this.suspendedReason };
+    if (!this.connected) return { paused: true, note: "Not connected; this session is not polling After Effects." };
+    if (this.hostAsleep) return { paused: true, note: "Already paused." };
+    try {
+      await this.call("pause");
+    } catch (e) {
+      if (/Unknown op 'pause'/.test(e.message)) {
+        throw new Error("The installed After Effects host script is too old to pause. Re-run install.ps1 as " +
+          "Administrator and restart AE.");
+      }
+      throw e;
+    }
+    return { paused: true, note: "Polling paused. It restarts automatically on the next After Effects call." };
+  }
+
   status() {
     return {
       connected: this.connected,
@@ -176,8 +212,11 @@ export class BridgeClient {
       this.failedConnects = 0;
       this.dormant = false;
       this.hostHeard = false;
+      this.hostAsleep = false;
       this.lastHeard = Date.now();
       dbg("connected, localPort=", socket.localPort);
+      // The host may have paused polling while idle; make sure it is running.
+      this._wakeHost();
     });
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
@@ -244,6 +283,13 @@ export class BridgeClient {
         this._suspend("This Claude session was disconnected from After Effects because another session took over.");
         return;
       }
+      if (msg.event === "sleep") {
+        // AE paused polling (we were idle). A request already in flight is sitting unread: wake it now.
+        this.hostAsleep = true;
+        if (this.pending.size) this._wakeHost();
+        continue;
+      }
+      this.hostAsleep = false;
       const p = this.pending.get(msg.id);
       if (!p) {
         dbg("received response for unknown/unmatched id:", msg.id, "pending ids:", [...this.pending.keys()]);
@@ -311,6 +357,7 @@ export class BridgeClient {
         "(check %TEMP%\\claude-ae-bridge.log for its startup log)."
       );
     }
+    if (this.hostAsleep) this._wakeHost();
     // After a quiet spell, check AE is answering before sending the real call, so a dead
     // poll task is revived by the probe's recovery instead of the real call timing out.
     if (op !== "ping" && Date.now() - this.lastHeard > IDLE_PROBE_MS) {

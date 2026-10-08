@@ -13,6 +13,11 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
 
     var PORT = 41890;
     var POLL_MS = 25;
+    // Polling pauses (see sleepPolling) NO_CLIENT_SLEEP_MS after the last client
+    // goes away, or when a client sends the `pause` op (ae_pause). While a client is
+    // connected it never pauses on its own: a working Claude's calls can be minutes
+    // apart, and every wake can bring the AE window to the front.
+    var NO_CLIENT_SLEEP_MS = 5000;
     // Don't start polling until AE has had time to finish launching/opening
     // its project; a scheduled task that fires while a startup modal is up
     // gets blocked by AE.
@@ -145,6 +150,13 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     var ops = {
         ping: function () {
             return { pong: true, appVersion: app.version, time: new Date().getTime() };
+        },
+
+        // Pause polling right after this response is sent (see sleepPolling). The
+        // server wakes it again on its next call.
+        pause: function () {
+            pauseRequested = true;
+            return { paused: true };
         },
 
         listCompositions: function () {
@@ -1186,6 +1198,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
 
     function handleLine(line) {
         var id = null;
+        lastActivity = new Date().getTime();
         if (DEBUG) log("Received line (" + line.length + " chars): " + line);
         try {
             var req = jsonParse(line);
@@ -1210,6 +1223,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                 log("Failed to write error response: " + e2.toString());
             }
         }
+        lastActivity = new Date().getTime();
     }
 
     // Tell a client it is being displaced by a newer one, so it can stay
@@ -1223,6 +1237,54 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     }
 
     var polling = false;
+    var bootstrapTaskIds = [];
+    var pollTaskId = null;
+    var lastActivity = new Date().getTime();
+    var pauseRequested = false;
+
+    // While the poll task is registered it fires every 25ms. That has two visible
+    // side effects, so it only runs while the bridge is in use:
+    //  - a modal dialog (colour picker, Map Black To...) blocks the task and AE
+    //    shows "Cannot run a script while a modal dialog is waiting for response";
+    //  - AE re-evaluates the cursor on every script run, so tool cursors (pen,
+    //    shape) flicker back to the arrow.
+    // After a quiet spell the task is cancelled. The server wakes it by running
+    // host/start-bridge.jsx (-> wake()) when it connects or has a call to send.
+    function cancelPollTasks() {
+        if (pollTaskId !== null) {
+            try { app.cancelTask(pollTaskId); } catch (e) {}
+            pollTaskId = null;
+        }
+        // task registered by host/start-bridge.jsx
+        var kickId = $.global.__claudeKickPollId;
+        if (kickId) {
+            try { app.cancelTask(kickId); } catch (e2) {}
+            $.global.__claudeKickPollId = null;
+        }
+    }
+
+    function sleepPolling() {
+        if (client) {
+            // Let the server know, so it wakes us before its next call.
+            try { sendLine(jsonStringify({ event: "sleep" })); } catch (e) {}
+        }
+        cancelPollTasks();
+        log("idle - polling paused (the server wakes it on the next call)");
+    }
+
+    // Registers a fresh poll task from the caller's context. Tasks registered
+    // from an `AfterFX.exe -r` script always fire; ones registered at launch have
+    // sometimes been dead, so any old poll task is replaced.
+    function wake() {
+        lastActivity = new Date().getTime();
+        for (var i = 0; i < bootstrapTaskIds.length; i++) {
+            try { app.cancelTask(bootstrapTaskIds[i]); } catch (e) {}
+        }
+        bootstrapTaskIds = [];
+        cancelPollTasks();
+        pollTaskId = app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, true);
+        log("polling started (every " + POLL_MS + "ms)");
+    }
 
     // Runs on a repeating scheduled task. A tick that AE blocks (e.g. a modal
     // dialog is open) is simply skipped and the next one runs normally; the
@@ -1234,6 +1296,12 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
             pollOnce();
         } finally {
             polling = false;
+        }
+        // After pollOnce: a long macro or a read must not count as idleness.
+        var idleFor = new Date().getTime() - lastActivity;
+        if (pauseRequested || (!client && idleFor > NO_CLIENT_SLEEP_MS)) {
+            pauseRequested = false;
+            sleepPolling();
         }
     }
 
@@ -1263,6 +1331,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                         try { client.close(); } catch (eClose) {}
                     }
                     client = incoming;
+                    lastActivity = new Date().getTime();
                     client.timeout = READ_TIMEOUT_SEC;
                     consecutiveReadErrors = 0;
                     rxBuffer = "";
@@ -1274,6 +1343,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                 if (!client.connected) {
                     log("Client disconnected");
                     client = null;
+                    lastActivity = new Date().getTime();
                     rxBuffer = "";
                 } else {
                     drainLines();
@@ -1311,6 +1381,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
                 if (client && !client.connected) {
                     log("Client disconnected during read: " + e.toString());
                     client = null;
+                    lastActivity = new Date().getTime();
                     rxBuffer = "";
                 }
                 return;
@@ -1336,9 +1407,6 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
     }
 
-    var bootstrapTaskIds = [];
-    var pollTaskId = null;
-
     // Fires once START_DELAY_MS after launch, cancels itself, then starts the
     // repeating poll task. The bootstrap is itself a repeating task so that if
     // its first tick is blocked by a modal dialog it just fires again later.
@@ -1349,6 +1417,7 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
         bootstrapTaskIds = [];
         if (pollTaskId !== null) return;
+        lastActivity = new Date().getTime();
         pollTaskId = app.scheduleTask("$.global.__claudeBridge.poll()", POLL_MS, true);
         log("polling started (every " + POLL_MS + "ms)");
     }
@@ -1362,5 +1431,5 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
     }
     log("claude-bridge initialized (PORT=" + PORT + "), polling starts in " + START_DELAY_MS + "ms (backup timers: 45s, 120s; task ids " + bootstrapTaskIds.join(",") + ")");
 
-    return { poll: poll, bootstrap: bootstrap, dispatch: dispatch, PORT: PORT };
+    return { poll: poll, bootstrap: bootstrap, wake: wake, dispatch: dispatch, PORT: PORT };
 })();
