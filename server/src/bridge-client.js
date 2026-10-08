@@ -161,7 +161,7 @@ export class BridgeClient {
   // user works in AE). It restarts by itself on the next call. Stays connected.
   async pause() {
     if (this.suspendedReason) return { paused: false, note: this.suspendedReason };
-    if (!this.connected) return { paused: true, note: "Not connected; this session is not polling After Effects." };
+    if (!this.connected) return { paused: false, note: "This session is not connected, so it cannot pause After Effects (AE keeps polling until a connected session pauses it). Call ae_connect then ae_pause, or say pause before disconnecting." };
     if (this.hostAsleep) return { paused: true, note: "Already paused." };
     try {
       await this.call("pause");

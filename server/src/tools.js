@@ -54,7 +54,7 @@ export function registerTools(server, bridge) {
   tool(
     "ae_disconnect",
     "Release this session's After Effects connection so another Claude session can use it. This session " +
-      "stays disconnected until ae_connect is called.",
+      "stays disconnected until ae_connect is called. Does NOT pause After Effects' polling: to quiet AE as well, call ae_pause first, then ae_disconnect.",
     {},
     () => bridge.disconnect()
   );

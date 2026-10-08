@@ -19,9 +19,11 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   once (see rule 7). `ae_ping` should answer in milliseconds; it times out at 5s.
 - User says "pause" / "ae pause" / "stop the bridge" → call `ae_pause` (stops AE polling at once, stays
   connected; the next AE call restarts it automatically — that wake can bring the AE window to the front).
-- The host polls continuously while a session is connected (AE can show the
-  modal-dialog error / flicker the tool cursor); it stops 5s after disconnect or on `ae_pause`,
-  and the server wakes it automatically on connect/next call (+~0.2–0.4s). A ping/call timeout on a live connection
+- The host polls continuously and **never pauses on its own** (AE can then show the
+  modal-dialog error / flicker the tool cursor). It stops only on `ae_pause` and the
+  server wakes it automatically on connect/next call (+~0.2–0.4s). To quiet AE and
+  release it: `ae_pause` first, then `ae_disconnect` (disconnect alone leaves it
+  polling; a session that is not connected cannot pause it). A ping/call timeout on a live connection
   also auto-runs `host/start-bridge.jsx`; don't re-diagnose that, just retry. Never cancel scheduled-task ids you
   didn't create (other panels share the id space).
 
@@ -396,15 +398,13 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   poll task itself, so the error can't be caught in our script; (2) tool
   cursors (pen/shape) flickered between the tool and the arrow, even after
   `ae_disconnect`, because each task run makes AE re-evaluate the cursor.
-  Now the host cancels the poll task 5s after the last client goes away (e.g.
-  `ae_disconnect`) or when told to (`ae_pause`), and sends `{"event":"sleep"}`.
-  **While a session is connected it never pauses on its own** (an idle timer was
-  tried at 15s and 60s: the server can't see when a Claude turn ends, only calls,
+  Now the host cancels the poll task only when told to (`ae_pause`) and sends
+  `{"event":"sleep"}`. **It never pauses on its own** (idle timers were tried at
+  5s/15s/60s and removed: the server can't see when a Claude turn ends, only calls,
   and gaps between a working Claude's calls exceed those, so it kept pausing and
   waking mid-task, and every wake can bring the AE window to the front). So the
-  flicker/modal error persist while connected unless the user says pause. A
-  client that dies without closing its socket keeps the host polling until a new
-  client connects or `ae_pause`. The
+  flicker/modal error persist, including after `ae_disconnect`, unless a connected
+  session pauses first. The
   server wakes it by running `start-bridge.jsx` (→ `wake()`, which registers a
   fresh task from the `-r` context) on every connect, and before a call when it
   knows the host is asleep (min 3s between runs). `ae_pause` pauses on demand (host op `pause`; needs the new host installed).
