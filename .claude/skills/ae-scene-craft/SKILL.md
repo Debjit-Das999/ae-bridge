@@ -91,31 +91,18 @@ area. If the elements are visually meant to line up as a group regardless of wha
 one is near, position them independently in absolute coordinates instead of inheriting
 from whichever nearby object seems like the natural parent.
 
-## 3. Batch related calls, but keep batches modest
+## 3. Batch related calls (limits verified)
 
 `ae_batch` runs a sequence of tool calls in one round trip inside a single undo group,
 and using it for a related group of calls (creating several layers, setting several
 properties, adding several keyframes) is noticeably faster than firing them one at a
 time.
 
-There are two distinct ways a batch can go wrong, and the safer habit covers both: aim
-for roughly 4-6 calls per batch, even when every call is short.
-
-The first is a long request line — a batch with a lot of calls that each carry
-substantial string content (several text layers' worth of font names, colors, and
-positions, for instance) can produce a single line long enough to break the socket
-transport. This one corrupts the connection: the bridge stops responding to everything,
-including `ae_ping`, and needs an After Effects restart to recover.
-
-The second is sneakier: a batch of *short* calls — plain numbers and small arrays, no
-long strings — can also silently fail past a certain count (observed at 8 calls; 4
-worked immediately with the exact same content just split in half). The difference is
-that the bridge stays healthy — `ae_ping` and other calls work fine right after — but
-the batch's own changes simply never applied, with no error to flag it. So after any
-batch you're not fully confident about, it's worth a quick `ae_ping`: if it responds,
-the bridge is fine and the batch likely no-op'd silently (re-verify the state you
-expected and redo it in smaller pieces); if `ping` also hangs, that's the connection-
-corrupting variant and only an After Effects restart will clear it.
+Earlier versions of the bridge dropped large or many-call requests (fragmented reads, and responses
+containing empty arrays being split on raw newlines). Both are fixed (see CLAUDE.md, ROOT CAUSES), and
+the old "4-6 calls per batch" rule no longer applies: a 100-call batch and an 11-call batch with ~3KB of
+text both succeed. What still matters is the timeout budget and verifying state after any failure,
+covered next.
 
 **Re-list before trusting an index across a batch boundary.** If a batch created,
 deleted, or reordered layers, call `ae_list_layers` again before the next batch
@@ -137,38 +124,23 @@ misuse, not a security sandbox, so treat it with the same trust boundary as ever
 tool here: fine to use freely against your own bridge, not something to expose to a
 network you don't control.
 
-**`ae_run_macro` is not immune to `ae_batch`'s silent-timeout problem — same discipline
-applies.** A macro with 4+ `ops.*` calls in it can time out client-side at 60s while
-actually succeeding on the AE side (confirmed via re-export after the timeout), and a
-macro with ~9-11 calls plus heavy literal data (e.g. vertex arrays) can genuinely fail
-outright. This was first suspected to be about which *effect* was targeted (repeated
-`setEffectProperty` calls against one 4-Color Gradient instance were slow; single calls
-against different Fill instances were fast) — checking Adobe's scripting docs turned up
-nothing marking any specific effect as unusually expensive, and the pattern that actually
-fits the observed timeouts is call-count-per-macro, not effect identity. Keep macro
-scripts to a handful of `ops.*` calls, same rule of thumb as `ae_batch`'s 4-6 calls; if a
-macro times out, check `ae_ping` and re-verify state before assuming it failed.
+**`ae_run_macro` limits (verified 2026-10-07 after the transport fixes):** macros of ~1,600 ops run in
+about 16s and 2,000 cheap ops in under half a second, so there is no "handful of ops" rule any more.
+The real limits are the 60s client timeout per macro (15s for other calls, 5s for ping) and that AE
+cannot interrupt a macro once it is running, so keep any single call well under 60s and split a long
+build into logical steps. If a macro or batch times out or errors, `ae_ping` and then list what exists
+before re-running it: it may have partly applied, and only read-only calls are safe to retry blindly.
 
-**Default to `AfterFX.exe -r "<script.jsx>"` for any new scene build, not just large ones.**
-Write one comprehensive script that does as close to 100% of the work as possible —
-background, every element, real assets (check what's available and ask the user for
-anything missing rather than guessing), styling — and only fall back to the bridge
-(`ae_*` tools) for the smaller adjustments an exported check reveals are needed. This
-has been the reliable, low-timeout-risk approach on every build since adopting it; see
-CLAUDE.md's Core Rules for the same guidance. The reasoning that originally motivated
-it still applies too — it beats `ae_run_macro` entirely for complex builds and pins the
-timeout problem on the bridge, not AE. Confirmed directly: a
-94-layer build (10 cards, nested shape groups, path trims, keyframes, expressions) ran via
-`-r` in 2-3 seconds on the same running AE instance where much smaller `ae_run_macro` calls
-had just timed out or failed outright. When AE is already open, `-r` runs the script against
-*that* instance and its current project — no second AE process, no file-lock conflict, no
-60-second ceiling, no socket framing to corrupt. Write the script to a `.jsx` file and run
-`"<path to AfterFX.exe>" -r "<path to script>"`. Three real caveats: it has no blocklist at
-all (only run scripts you've read and trust — this bypasses every guard `ae_run_macro` has),
-strip any `alert()`/`confirm()`/`prompt()` first (a modal blocks AE waiting for a click that
-will never come from a CLI invocation), and don't guess at other flags — an unrecognized one
-(e.g. a bare `-help`) gets misread as "import this as a file" against the running instance
-and throws a visible error dialog in the user's AE window.
+**Routing between the bridge and a JSX script is governed by CLAUDE.md rule 7: bridge by default,
+ask the user once before a large new build (JSX script vs bridge steps), remember the answer for
+the session, and fall back to JSX automatically if the bridge is down.** (An older version of this
+skill said to default to `-r` for every build; that predates the transport fixes and is withdrawn.)
+What is still true of the JSX route: `AfterFX.exe -r "<script.jsx>"` runs against the already-open AE
+and its current project with no 60-second ceiling and no socket layer, so it suits very large one-shot
+builds. Three caveats: it has no blocklist at all (only run scripts you have read and trust), strip any
+`alert()`/`confirm()`/`prompt()` first (a modal blocks AE waiting for a click that never comes), and do
+not guess at other flags (an unrecognized one such as `-help` is misread as "import this file" and
+throws a visible error dialog in the user’s AE window).
 
 ## 4. Animation and rigging craft
 
@@ -219,3 +191,54 @@ nothing errors if you skip it — the only sign is the render looking slightly w
 intentional, especially on an entrance or exit. `ae_set_keyframe_easing` with
 `easyEase: true` (or explicit interpolation types) is a small addition that makes the
 difference between motion that reads as "keyframed" and motion that reads as designed.
+
+## 5. Look-and-feel recipes (verified on AE 26.5)
+
+These were each learned the hard way while recreating reference designs; they save the
+trial and error.
+
+**Shape layers**
+- **Group order: the first group added renders in FRONT.** Add the details (lines, badges,
+  headers) first and the card/background group LAST. Within a group add the stroke before
+  the fill, or the fill covers the inner half of the border.
+- **Rounded corners on polygons:** add a stroke the same color as the fill (~12px) with Line
+  Join = round (`ADBE Vector Stroke Line Join` = 2). The Round Corners operator does nothing.
+- **Dashed lines:** under the stroke’s `ADBE Vector Stroke Dashes` group,
+  `addProperty("ADBE Vector Stroke Dash 1")` and `("ADBE Vector Stroke Gap 1")`, then setValue.
+- **Effects on a shape layer (blur, glow) are clipped to the shape’s bounding box**, giving
+  hard straight edges. Add a near-invisible full-comp rectangle (fill opacity ~1%) to that
+  layer, or build the element on a solid instead.
+- **Real gradients:** gradient-fill stops can’t be scripted. Use a comp-size solid with
+  Gradient Ramp (`ADBE Ramp`: Start of Ramp / Start Color / End of Ramp / End Color) matted by a
+  shape layer: `shade.setTrackMatte(matte, TrackMatteType.ALPHA)`, `matte.enabled = false`, then
+  `shade.moveBefore(shapeLayer)` so it sits above the shape but below the text.
+- **Background gradients:** `ADBE 4ColorGradient` (Point 1-4, Color 1-4 as RGBA 0-1, Blend);
+  animate the points for slow drift. Grain: `ADBE Noise` -> "Amount of Noise" (default 0; ~3).
+
+**Parenting, text and stacking**
+- **Opacity is NOT inherited through parenting** (position/scale/rotation are). Keyframe the
+  children’s opacity too, or titles pop in before their card.
+- **Set `.parent` first, then set Position** (local = absolute - parent position); setting
+  position first makes AE compensate and the child jumps.
+- **Text:** to hit a target width, create it, then scale the font size by
+  `target / sourceRectAtTime(...).width`. Center on the ink rect:
+  `pos = target - (rect.left + rect.width/2, rect.top + rect.height/2)`. Set justification,
+  leading (`autoLeading = false`) and tracking (an integer) through `TextDocument`; use ``
+  for line breaks. Inter has Regular/Medium/SemiBold only (no Bold); Montserrat has the full family.
+- **New layers insert at index 1** (top). Create backgrounds first and text last, or reorder with
+  `moveBefore`/`moveAfter`. Text must be above its shape layer.
+
+**Effect parameter facts**
+- **Drop Shadow** (`ADBE Drop Shadow`): Shadow Color, Opacity (**0-255 scale**, 127.5 = 50%),
+  Direction, Distance, Softness. Reading every property back without try/catch has thrown.
+- **Deep Glow 2** (`PEDG2`): Exposure and Radius. The default Radius 1000 floods the frame;
+  ~150-300 gives a tight glow. This install reports as unlicensed.
+- For any other effect, list `effect.property(i).name` once instead of guessing names.
+
+**Recreating a reference image**
+- Make the comp the reference’s aspect ratio and scale every coordinate by one factor
+  `K = compWidth / refWidth`. Measure text widths in the reference, fit font sizes to them, then
+  render and compare widths and positions instead of eyeballing.
+- Icons are placeholders: nulls parented to their card, scaled to the icon footprint, created
+  LAST (each null adds a project item and shifts comp indices; resolve the comp by name).
+- Say plainly what the bridge can’t do (gradient fills, missing fonts) rather than faking it silently.

@@ -254,8 +254,19 @@ export class BridgeClient {
       clearTimeout(p.kickTimer);
       this.pending.delete(msg.id);
       if (msg.ok) p.resolve(msg.result);
-      else p.reject(new Error(msg.error?.message || "Unknown AE bridge error"));
+      else p.reject(new Error(this._explainError(msg.error?.message || "Unknown AE bridge error")));
     }
+  }
+
+  // AE occasionally throws "invalid numeric result (divide by zero?)" for a call that
+  // works when re-run unchanged (seen ~4 times/day, in clusters, on read-heavy macros;
+  // not tied to the script or request size). Say so, so callers retry instead of debugging.
+  _explainError(message) {
+    if (/invalid numeric result/i.test(message)) {
+      return message + " [Known transient AE error: re-running the same call usually succeeds. If this was a " +
+        "macro that changes the project, first check what it already applied (e.g. ae_list_layers) before re-running.]";
+    }
+    return message;
   }
 
   _rejectAllPending(err) {

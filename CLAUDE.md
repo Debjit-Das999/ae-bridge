@@ -11,6 +11,47 @@ Don't edit, commit to, or push the Mac repo from work on this one, and keep
 Windows-specific details (`install.ps1`, `AfterFX.exe -r`, `%TEMP%`) here.
 Fixes that apply to both (e.g. transport/host-script bugs) must be ported by hand.
 
+## Quick checklist (the mistakes that have cost the most time — details below)
+
+**Connecting**
+- Only one Claude session holds AE. A call that says this session "was
+  disconnected because another session took over" → call `ae_connect`, retry
+  once (see rule 7). `ae_ping` should answer in milliseconds; it times out at 5s.
+- A ping/call timeout on a live connection auto-runs `host/start-bridge.jsx`;
+  don't re-diagnose that, just retry. Never cancel scheduled-task ids you
+  didn't create (other panels share the id space).
+
+**Before you build**
+- Test in a throwaway comp you create, and **resolve the comp by name inside
+  every macro** (`for` over `app.project.item(i)` matching `CompItem` + name).
+  Creating ANY project item (solid, null, comp, folder, footage) shifts comp
+  indices — that once sent a stress test into the user's real comp.
+- Don't touch the user's existing comps/layers beyond what was asked, and
+  never save the project (`app.project.save` is blocked and not yours to do).
+- Check fonts exist (`app.fonts.allFonts`) and effect matchNames
+  (`ae_list_available_effects`) before using them; verify numeric ranges
+  before `setValue` (rule 8).
+
+**While building**
+- Build in logical steps and check each with `ae_export_frame` (argument is
+  `timeInSeconds`). A clean `ok:true` is not proof; read back or render.
+- A failed/partial macro may have already created things. After any error or
+  timeout, list what exists *before* re-running (blind re-runs duplicate
+  layers). Only read-only calls are safe to retry blindly.
+- Name everything you create with a clear prefix, and keep one build =
+  one script/macro sequence you can re-run cleanly: remove your previous
+  attempt (by name/tag, never by index) before rebuilding, so failed attempts
+  don't leave duplicate comps/footage behind.
+- Look-and-feel recipes (shape group order, opacity vs parenting, glow
+  clipping, gradients, text fitting) are in the `ae-scene-craft` skill.
+
+**Limits that are verified (so don't invent smaller ones)**
+- 100-call `ae_batch`, 1,600-op macros (~16s), multi-KB requests and 4MB
+  responses all work. Timeouts: macro 60s, other calls 15s, ping 5s. AE can't
+  interrupt a running macro, so keep any single call well under 60s.
+- Transient AE error `invalid numeric result (divide by zero?)`: re-run
+  read-only calls once; for mutating macros check state first.
+
 ## Core rules
 
 1. **Never trust an index across calls.** Re-list (`ae_list_compositions`,
@@ -151,6 +192,31 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   bridge recovers cleanly; connection fine after 2.5min idle; unicode/CRLF/
   U+2028 round-trip. Not tested: requests >64KB (tested to ~9KB), batches
   >100 calls. No remaining transport failures reproduced.
+- **Copying/rebuilding comps by script — three AE 26.5 facts found by a chat
+  that rebuilt one comp from another (diff result: 0 differences across ~9,800
+  properties once these were handled).** (1) `Property.canSetValue` can't be
+  relied on in this AE — a guard like `if (!p.canSetValue) continue` silently
+  skipped every static value (positions, text, colors) so only keyframes and
+  expressions got copied; just try `setValue` in a try/catch. (2) `layer.nullLayer`
+  is read-only: create nulls with `addNull`, don't flip a flag on a normal layer.
+  (3) Text-animator properties start hidden and must be `addProperty`'d before
+  they can be set. Also note each rebuild attempt leaves its footage items
+  behind (~99 per run here; the project went 152 -> 201 items), so clean up
+  failed attempts by name/tag as described under "Solids and nulls".
+- **Transient `invalid numeric result (divide by zero?)` from AE (2026-10-08).**
+  Evidence: 4 occurrences in ~a day (Oct 7 14:07; Oct 8 12:02, 12:11:00,
+  12:11:32), clustered in time, on read-heavy macros (iterating comps,
+  reading effect/Position/keyframe values) — and **every time the identical
+  script succeeded when simply re-run**. Not tied to request size (362–4956
+  chars), not to client swaps/reconnects (no host-log events nearby), and not
+  to any unreadable property: a read-only walk of all 19,702 property values
+  in the two comps involved had 0 failures. Trigger unknown (clustering
+  suggests AE's momentary state). Handling: `bridge-client.js` appends a
+  "known transient, re-run" hint to this error. **Retry once immediately for
+  read-only work. For a macro that modifies the project, first check what it
+  already applied (`ae_list_layers`, etc.) — it can fail partway and a blind
+  re-run would duplicate layers/effects.** Don't auto-retry macros for the
+  same reason.
 - **Macro/batch ops address comps by index — and creating ANY project item
   (solid, comp, folder, footage) mid-script shifts those indices.** In a
   stress test, `ops.createSolid({compIndex: N})` followed by more ops with the
@@ -184,13 +250,11 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
      in one request line matters too, and 8 short calls already crossed
      whatever the real limit is.
 
-  Root cause not fixed for either. Workaround: **keep batches to roughly
-  4-6 calls**, even when every call is short — don't assume "8 is fine
-  because they're small." If a batch fails, first check whether the bridge
-  is still responsive (`ae_ping`) — if it is, the batch likely just
-  silently no-op'd (re-verify state and redo in smaller batches); if `ping`
-  also hangs, that's the connection-corrupting variant and needs an AE
-  restart.
+  **SUPERSEDED (2026-10-07): both modes were the transport bugs described in
+  the ROOT CAUSES entry above and are fixed.** The "4-6 calls per batch" rule
+  no longer applies — a 100-call batch and an 11-call batch with ~3KB of text
+  both succeed. What still holds: if a batch/macro times out, `ae_ping`, then
+  *verify state* before redoing it (it may have partly applied).
 - **`ae_run_macro` has the SAME silent-timeout failure mode as `ae_batch`'s
   #2 above, not just `ae_batch`.** Observed rebuilding the same diagram via
   macros: a 4-`setEffectProperty`-call macro (setting a 4-Color Gradient's
@@ -207,10 +271,11 @@ Fixes that apply to both (e.g. transport/host-script bugs) must be ported by han
   anything marking 4-Color Gradient as unusually expensive to script:
   nothing found. The variable that actually lines up with every timeout in
   this session's log is calls-per-macro (4, 9, 11 all timed out or failed;
-  1-3 never did), same as `ae_batch`'s documented limit. Treat `ae_run_macro`
-  scripts with the same "keep it to a handful of ops" discipline as
-  `ae_batch` batches — looping many `ops.*` calls in one macro doesn't
-  avoid this the way it avoids `ae_batch`'s per-call network overhead.
+  1-3 never did), same as `ae_batch`'s documented limit.
+  **SUPERSEDED (2026-10-07):** that was the transport bugs, now fixed. Macros
+  of 1,600 ops (~16s) and 2,000 cheap ops (~0.4s) run fine; the "handful of
+  ops" rule is obsolete. The real limits: client timeout 60s per macro (15s
+  other calls, 5s ping), and AE cannot interrupt a macro once it is running.
 - **The `ae_run_macro`/`ae_batch` timeouts are a property of the bridge's
   socket transport itself, not of AE or of script size/complexity** —
   confirmed by directly comparing against `AfterFX.exe -r` (see the Recipes
