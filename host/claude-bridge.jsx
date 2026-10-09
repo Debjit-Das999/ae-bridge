@@ -522,6 +522,35 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
             return { index: findItemIndex(newComp), name: newComp.name };
         },
 
+        // Adds an existing composition to another one as a (nested) layer. Resolve the
+        // source by name when possible: creating any project item shifts comp indices.
+        addCompAsLayer: function (a) {
+            var target = getComp(a.compIndex);
+            var source = null;
+            if (a.sourceCompName) {
+                var matches = 0;
+                for (var i = 1; i <= app.project.numItems; i++) {
+                    var it = app.project.item(i);
+                    if (it instanceof CompItem && it.name === a.sourceCompName) { source = it; matches++; }
+                }
+                if (!matches) throw new Error("No composition named '" + a.sourceCompName + "'");
+                if (matches > 1) throw new Error(matches + " compositions are named '" + a.sourceCompName + "' - use sourceCompIndex");
+            } else if (a.sourceCompIndex) {
+                source = getComp(a.sourceCompIndex);
+            } else {
+                throw new Error("addCompAsLayer requires sourceCompName or sourceCompIndex");
+            }
+            if (source === target) throw new Error("A composition cannot contain itself");
+            // AE itself refuses (throws) if this would make a circular nesting.
+            var layer = target.layers.add(source);
+            if (a.layerName) layer.name = a.layerName;
+            if (a.startTime !== undefined) layer.startTime = a.startTime;
+            return {
+                index: layer.index, name: layer.name, sourceComp: source.name,
+                startTime: layer.startTime, inPoint: layer.inPoint, outPoint: layer.outPoint
+            };
+        },
+
         duplicateLayer: function (a) {
             var comp = getComp(a.compIndex);
             var layer = getLayer(comp, a.layerIndex);

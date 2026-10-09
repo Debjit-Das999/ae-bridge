@@ -159,6 +159,8 @@ layers forms one coherent thing (five pyramid bands that always move together, a
 made of several shapes), collapsing it with `ae_precompose` turns it into a single
 layer you can animate as one unit — fade the whole thing in with one Opacity keyframe
 pair instead of five, and keep the top-level timeline readable as the scene grows.
+To nest a comp that already exists inside another one, use `ae_add_comp_as_layer`
+(give the source by name, not index).
 
 **Give a camera a point-of-interest null.** The standard AE pattern is to parent the
 camera to a null, so the look-at target can be repositioned independently of the

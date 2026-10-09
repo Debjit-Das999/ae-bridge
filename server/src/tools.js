@@ -412,6 +412,27 @@ export function registerTools(server, bridge) {
   );
 
   tool(
+    "ae_add_comp_as_layer",
+    "Add an existing composition to another composition as a nested layer (like dragging a comp into a " +
+      "timeline). Give the source by name (preferred: project-item indices shift whenever anything is " +
+      "created) or by project-panel index. Returns the new layer's index (it lands on top, shifting " +
+      "the others down). Fails if it would nest a comp inside itself or create a loop.",
+    {
+      compIndex: z.number().int().positive().describe("Composition to add the layer to"),
+      sourceCompName: z.string().optional().describe("Name of the composition to nest (exact match)"),
+      sourceCompIndex: z.number().int().positive().optional().describe("Project-panel index of the composition to nest, if not using a name"),
+      layerName: z.string().optional().describe("Rename the new layer"),
+      startTime: z.number().optional().describe("Layer start time in seconds (default 0)"),
+    },
+    (args) => {
+      if (!args.sourceCompName && !args.sourceCompIndex) {
+        throw new Error("Give sourceCompName or sourceCompIndex");
+      }
+      return bridge.call("addCompAsLayer", args);
+    }
+  );
+
+  tool(
     "ae_duplicate_layer",
     "Duplicate a layer. Returns the new duplicate's index — re-check with ae_list_layers rather than " +
       "assuming it, since duplicating shifts every layer below it down by one.",
