@@ -126,6 +126,45 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
         }
         return null;
     }
+    // Value of a property as plain JSON-able data, or { error } if it has none.
+    function readPropertyValue(prop, t) {
+        if (prop.propertyType !== PropertyType.PROPERTY) {
+            return { error: "'" + prop.name + "' is a property group, not a value" };
+        }
+        var vt = prop.propertyValueType;
+        if (vt === PropertyValueType.NO_VALUE || vt === PropertyValueType.CUSTOM_VALUE) {
+            return { error: "'" + prop.name + "' has no readable value" };
+        }
+        var v = (t !== undefined && t !== null) ? prop.valueAtTime(t, false) : prop.value;
+        if (vt === PropertyValueType.SHAPE) {
+            v = { vertices: v.vertices, inTangents: v.inTangents, outTangents: v.outTangents, closed: v.closed };
+        } else if (vt === PropertyValueType.TEXT_DOCUMENT) {
+            v = { text: v.text, font: v.font, fontSize: v.fontSize, fillColor: v.fillColor };
+        } else if (vt === PropertyValueType.MARKER) {
+            v = { comment: v.comment };
+        }
+        var out = { value: v, numKeys: prop.numKeys };
+        try { if (prop.canSetExpression && prop.expressionEnabled) out.expression = prop.expression; } catch (e) {}
+        return out;
+    }
+    // owner: a Layer or an effect. a.propertyName and/or a.propertyNames, optional a.timeInSeconds.
+    function readProperties(owner, a) {
+        var names = [];
+        if (a.propertyName) names.push(a.propertyName);
+        if (a.propertyNames) for (var n = 0; n < a.propertyNames.length; n++) names.push(a.propertyNames[n]);
+        if (!names.length) throw new Error("Give propertyName or propertyNames");
+        var out = {};
+        for (var i = 0; i < names.length; i++) {
+            try {
+                var prop = owner.property(names[i]);
+                out[names[i]] = prop ? readPropertyValue(prop, a.timeInSeconds) : { error: "No property '" + names[i] + "'" };
+            } catch (e) {
+                out[names[i]] = { error: e.toString() };
+            }
+        }
+        return out;
+    }
+
     // Builds a Shape object (vertices + bezier tangents) for a mask path or
     // a custom vector path. If inTangents/outTangents are omitted, zero
     // tangents are used (straight-line segments between vertices).
@@ -217,7 +256,10 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
             var out = [];
             for (var i = 1; i <= comp.numLayers; i++) {
                 var l = comp.layer(i);
-                out.push({ index: i, name: l.name, enabled: l.enabled, locked: l.locked, matchName: l.matchName });
+                out.push({
+                    index: i, name: l.name, enabled: l.enabled, locked: l.locked, matchName: l.matchName,
+                    startTime: l.startTime, inPoint: l.inPoint, outPoint: l.outPoint
+                });
             }
             return { layers: out };
         },
@@ -861,6 +903,22 @@ $.global.__claudeBridge = $.global.__claudeBridge || (function () {
             if (!prop) throw new Error("No property '" + a.propertyName + "' on layer '" + layer.name + "'");
             prop.setValueAtTime(a.timeInSeconds, a.value);
             return { layer: layer.name, property: prop.name, time: a.timeInSeconds };
+        },
+
+        // Reads current (or at-time) values of one or more properties. Several names
+        // per call; a bad name fails only its own entry. Layer properties are looked up
+        // like setLayerProperty does (display name or matchName).
+        getLayerProperty: function (a) {
+            var comp = getComp(a.compIndex);
+            var layer = getLayer(comp, a.layerIndex);
+            return { layer: layer.name, properties: readProperties(layer, a) };
+        },
+
+        getEffectProperty: function (a) {
+            var comp = getComp(a.compIndex);
+            var layer = getLayer(comp, a.layerIndex);
+            var effect = getEffect(layer, a.effectIndex);
+            return { layer: layer.name, effect: effect.name, properties: readProperties(effect, a) };
         },
 
         listKeyframes: function (a) {

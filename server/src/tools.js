@@ -2,7 +2,7 @@ import { z } from "zod";
 import { listPresets } from "./presets.js";
 
 function textResult(value) {
-  return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
+  return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 function errorResult(err) {
   return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
@@ -608,7 +608,7 @@ export function registerTools(server, bridge) {
 
   tool(
     "ae_list_layers",
-    "List layers in a composition with their name and 1-based index. Indices shift when layers are " +
+    "List layers in a composition with their name, 1-based index, enabled/locked state and timing (startTime, inPoint, outPoint, in seconds). Indices shift when layers are " +
       "added/removed/reordered — call this again before addressing a layer if the composition may have changed.",
     { compIndex: z.number().int().positive() },
     (args) => bridge.call("listLayers", args)
@@ -722,6 +722,48 @@ export function registerTools(server, bridge) {
       value: z.any(),
     },
     (args) => bridge.call("setLayerKeyframe", args)
+  );
+
+  tool(
+    "ae_get_layer_property",
+    "Read the current value of one or more layer properties (e.g. 'Position', 'Scale', 'Opacity', " +
+      "'Anchor Point'). Pass propertyName and/or a propertyNames list to read several in one call; a bad " +
+      "name only fails its own entry. Optional timeInSeconds reads the value at that time (for animated " +
+      "values) instead of the current one. Returns value, numKeys and, if one is active, the expression.",
+    {
+      compIndex: z.number().int().positive(),
+      layerIndex: z.number().int().positive(),
+      propertyName: z.string().optional(),
+      propertyNames: z.array(z.string()).optional(),
+      timeInSeconds: z.number().optional(),
+    },
+    (args) => {
+      if (!args.propertyName && !(args.propertyNames && args.propertyNames.length)) {
+        throw new Error("Give propertyName or propertyNames");
+      }
+      return bridge.call("getLayerProperty", args);
+    }
+  );
+
+  tool(
+    "ae_get_effect_property",
+    "Read the current value of one or more properties of an effect on a layer (effectIndex from " +
+      "ae_list_effects; property names as in ae_set_effect_property). Several per call via propertyNames; a " +
+      "bad name only fails its own entry. Optional timeInSeconds reads the value at that time.",
+    {
+      compIndex: z.number().int().positive(),
+      layerIndex: z.number().int().positive(),
+      effectIndex: z.number().int().positive(),
+      propertyName: z.string().optional(),
+      propertyNames: z.array(z.string()).optional(),
+      timeInSeconds: z.number().optional(),
+    },
+    (args) => {
+      if (!args.propertyName && !(args.propertyNames && args.propertyNames.length)) {
+        throw new Error("Give propertyName or propertyNames");
+      }
+      return bridge.call("getEffectProperty", args);
+    }
   );
 
   tool(
